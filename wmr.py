@@ -5,24 +5,31 @@ import time
 import struct
 import sys
 import io
+import binascii
 from enum import Enum
+import threading
 
 MICROSOFT_VID =                 0x045e
 HOLOLENS_SENSORS_PID =          0x0659
-TRANSFER_SIZE =                 617472
+TRANSFER_SIZE =                 0x97000
+HOLOLENS_MAGIC =                0x2B6F6C44
 
 class WmrCamera:
 
-    def __init__(self, cb=None):
-        self.cb = cb
+    def __init__(self):
         self.started = False
-        self.frame_timer = 0
+        self.thread = None
+
+        self.frames = [
+            np.zeros(1280*481, dtype=np.uint8),
+            np.zeros(1280*481, dtype=np.uint8),
+        ]
+
+        self.work_frame = 0
+
+        self.cv = threading.Condition()
         self.seq = 0
-        self.image = np.zeros(1280*481, dtype=np.uint8)
-        self.chunk = io.BytesIO(bytearray(24576))
-        self.chunk_id = None
-        self.chunk_len = 0
-        self.off = 0
+        self.grab_seq = 0
 
         self.context = usb1.USBContext()
         self.dev = self.context.openByVendorIDAndProductID(
@@ -34,9 +41,14 @@ class WmrCamera:
         self.dev.claimInterface(3)
         self.dev.resetDevice()
 
-        self.transfer = self.dev.getTransfer()
-        self.transfer.setBulk(0x85, TRANSFER_SIZE, self.transfer_cb)
-        self.transfer.setBuffer(TRANSFER_SIZE)
+        self.transfers = [
+            self.dev.getTransfer(),
+            self.dev.getTransfer(),
+        ]
+
+        for transfer in self.transfers:
+            transfer.setBulk(0x85, TRANSFER_SIZE, self.transfer_cb)
+            transfer.setBuffer(TRANSFER_SIZE)
 
     def __del__(self):
         self.stop()
@@ -54,22 +66,52 @@ class WmrCamera:
     def handle_events(self, tv=0):
         self.context.handleEventsTimeout(tv=tv)
 
-    def start(self):
+    def thread_func(self):
         self.started = True
-        self.frame_timer = time.time()
-        self.dev.bulkWrite(0x5, [0x44, 0x6c, 0x6f, 0x2b, 0x0c, 0x00, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00])
-        self.transfer.submit()
+
+        self.dev.bulkWrite(0x5, struct.pack('<IIHH',
+            HOLOLENS_MAGIC, # magic
+            0x0c, # length
+            0x81, # command
+            0x00, # padding maybe?
+        ))
+
+        for transfer in self.transfers:
+            transfer.submit()
+
+        while any(transfer.isSubmitted() for transfer in self.transfers):
+            try:
+                self.context.handleEvents()
+            except usb1.USBErrorInterrupted:
+                pass
+        
+
+    def start(self):
+        self.thread = threading.Thread(target=self.thread_func)
+        self.thread.start()
 
     def stop(self):
-        self.started = False
-        if self.transfer.isSubmitted():
-            self.transfer.cancel()
-        self.dev.bulkWrite(0x5, [0x44, 0x6c, 0x6f, 0x2b, 0x0c, 0x00, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00])
+        if self.started:
+            self.started = False
+            self.thread.join()
+            self.thread = None
+
+            self.dev.bulkWrite(0x5, struct.pack('<IIHH',
+                HOLOLENS_MAGIC, # magic
+                0x0c, # length
+                0x82, # command
+                0x00, # padding maybe?
+            ))
 
     def set_exposure_gain(self, camera_id, exposure, gain):
-        self.dev.bulkWrite(0x5, struct.pack('<10BHHHH',
-            0x44, 0x6c, 0x6f, 0x2b, 0x12, 0x00, 0x00, 0x00, 0x80, 0x00,
-            camera_id, gain, exposure, camera_id))
+        self.dev.bulkWrite(0x5, struct.pack('<IIHHHHH',
+            HOLOLENS_MAGIC, # magic
+            0x12, # length
+            0x80, # command
+            camera_id,
+            exposure, # 0-49665
+            gain, # 0-255
+            camera_id))
 
     def is_running(self):
         return self.started
@@ -89,62 +131,65 @@ class WmrCamera:
         self.dev.resetDevice()
         if restart:
             self.start()
-    
-    def parse_chunk(self, chunk):
-        header = chunk[0:32]
-        magic, = struct.unpack('<L', header[0:4])
-        if magic != 0x2B6F6C44:
-            print('wrong magic')
-            return
-
-        frame, = struct.unpack('<H', header[4:6])
-        chunk_id, = struct.unpack('<B', header[8:9])
-
-        if chunk_id == 25:
-            seq, = struct.unpack('<B', self.image[89:90])
-            if self.cb is not None:
-                self.cb(self, seq)
-        else:
-            size = 24576-32
-            offset = chunk_id * size
-            self.image[offset:offset+size] = chunk[32:]
 
     def parse_buffer(self, buffer):
         pos = 0
 
-        while pos < len(buffer):
-            if self.chunk_id == None:
-                header = buffer[pos:pos+32]
-                magic, = struct.unpack('<L', header[0:4])
+        # discard partial frames
+        if len(buffer) < 616538:
+            return
 
-                if magic == 0x2B6F6C44:
-                    self.off = 0
-                    self.chunk_id, = struct.unpack('<B', header[8:9])
-                    self.chunk_len = 2138 if self.chunk_id == 25 else 24576
-                    self.chunk.seek(0)
-                else:
-                    print('out of sync')
-                    return
-            else:
-                remaining = len(buffer) - pos
-                count = min(remaining, self.chunk_len - self.chunk.tell())
-                self.chunk.write(buffer[pos:pos+count])
-                pos += count
+        if not self.cv.acquire(False):
+            return
 
-                if self.chunk.tell() == self.chunk_len:
-                    self.parse_chunk(self.chunk.getbuffer())
-                    self.chunk.seek(0)
-                    self.chunk_id = None
-                    self.chunk_len = 0
+        next_id = 0
 
+        while len(buffer) - pos >= 32:
+            header = buffer[pos:pos+32]
+            pos += 32
+            magic, = struct.unpack('<I', header[0:4])
 
-    def get_image(self, id):
-        return self.image.view()[1280:].reshape((480,1280))[0:480]
+            if magic != HOLOLENS_MAGIC:
+                break
 
-    def get_meta(self, id):
-        img = self.image.view()
+            frame_id, = struct.unpack('<I', header[4:8])
+            chunk_id, = struct.unpack('<B', header[8:9])
+            chunk_len = 2080 if chunk_id == 25 else 24544
 
-        if (id & 1) == 0:
-            return img[0:640]
-        
-        return img[640:1280]
+            #print(binascii.hexlify(header))
+            
+            if chunk_id != next_id:
+                break
+            
+            next_id = chunk_id + 1
+
+            offset = chunk_id * 24544
+            self.frames[self.work_frame][offset:offset+chunk_len] = buffer[pos:pos+chunk_len]
+
+            if chunk_id == 25:
+                self.seq = frame_id
+                self.cv.notify()
+                break
+                
+            pos += chunk_len
+
+        self.cv.release()
+
+    def grab(self):
+        self.cv.acquire()
+        while self.seq == self.grab_seq:
+            self.cv.wait()
+
+        self.grab_seq = self.seq
+        self.work_frame = self.work_frame ^ 1
+
+        self.cv.release()
+
+    def retrieve(self, id):
+        id = id & 1
+        frame = self.frames[self.work_frame ^ 1].view().reshape((481,1280))
+        return frame[:, (id * 640):((id+1) * 640)]
+
+    def read(self):
+        self.grab()
+        return self.frames[self.work_frame ^ 1].view().reshape((481,1280))
