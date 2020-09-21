@@ -16,14 +16,11 @@ if __name__ == '__main__':
     orb = cv2.ORB_create(nfeatures=2048)
 
     while True:
-        img, frame_type = camera.read()
+        camera.grab()
 
-        # why it this wrong sometimes?
-        if frame_type != 0:
+        img = camera.retrieve(2)
+        if img is None:
             continue
-
-        seq = img[0][89]
-        exposure, = struct.unpack('>H', img[0][6:8])
 
         kp = orb.detect(img, None)
         kp, des = orb.compute(img, kp)

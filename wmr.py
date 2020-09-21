@@ -16,24 +16,20 @@ HOLOLENS_MAGIC =                0x2B6F6C44
 
 class WmrCamera:
 
-    class CameraFrame:
-        def __init__(self):
-            self.frame_type = 0
-            self.seq = 0
-            self.image = np.zeros(1280*481, dtype=np.uint8)
-
     def __init__(self):
         self.started = False
         self.thread = None
 
         self.pool = [
-            WmrCamera.CameraFrame(),
-            WmrCamera.CameraFrame(),
-            WmrCamera.CameraFrame(),
-            WmrCamera.CameraFrame(),
+            np.zeros(1280*481, dtype=np.uint8),
+            np.zeros(1280*481, dtype=np.uint8),
+            np.zeros(1280*481, dtype=np.uint8),
+            np.zeros(1280*481, dtype=np.uint8),
+            np.zeros(1280*481, dtype=np.uint8),
         ]
         self.frame = self.pool.pop()
-        self.frames = []
+        self.frames = [None, None]
+        self.grabbed = [None, None]
 
         self.cv = threading.Condition()
 
@@ -55,6 +51,12 @@ class WmrCamera:
         for transfer in self.transfers:
             transfer.setBulk(0x85, TRANSFER_SIZE, self.transfer_cb)
             transfer.setBuffer(TRANSFER_SIZE)
+
+        self.exposure = [0,0,0,0]
+        self.set_exposure_gain(0, 0, 500) # left 1
+        self.set_exposure_gain(1, 0, 500) # right 1
+        self.set_exposure_gain(2, 6000, 500) # left 2
+        self.set_exposure_gain(3, 6000, 500) # right 2
 
     def __del__(self):
         self.stop()
@@ -110,6 +112,9 @@ class WmrCamera:
             ))
 
     def set_exposure_gain(self, camera_id, exposure, gain):
+
+        self.exposure[camera_id] = exposure // 20
+
         self.dev.bulkWrite(0x5, struct.pack('<IIHHHHH',
             HOLOLENS_MAGIC, # magic
             0x12, # length
@@ -132,12 +137,6 @@ class WmrCamera:
         # read the next frame
         transfer.submit()
 
-    def reset(self):
-        restart = self.started
-        self.dev.resetDevice()
-        if restart:
-            self.start()
-
     def parse_buffer(self, buffer):
 
         # discard partial frames
@@ -157,12 +156,21 @@ class WmrCamera:
             # check if this is the last chunk
             if next_id == 26:
                 frame_type, = struct.unpack('<H', buffer[pos+4:pos+6])
-                self.frame.frame_type = frame_type
+                index = (frame_type >> 1) & 1
+
+                exposure, = struct.unpack('>H', self.frame[6:8])
+
+                # drop image if the exposure is wrong
+                if exposure != self.exposure[frame_type]:
+                    return
                 
                 with self.cv:
                     if len(self.pool) != 0:
-                        self.frames.append(self.frame)
+                        drop_frame = self.frames[index]
+                        self.frames[index] = self.frame
                         self.frame = self.pool.pop()
+                        if drop_frame is not None:
+                            self.pool.append(drop_frame)
                         self.cv.notify()
 
                 break
@@ -181,26 +189,32 @@ class WmrCamera:
             
             next_id = chunk_id + 1
 
-            if chunk_id == 0:
-                self.frame.seq = frame_id
-
             offset = chunk_id * 24544
             count = 2080 if chunk_id == 25 else chunk_len
-            self.frame.image[offset:offset+count] = buffer[pos:pos+count]
+            self.frame[offset:offset+count] = buffer[pos:pos+count]
 
             pos += chunk_len
 
-    def read(self):
+    def grab(self):
         self.cv.acquire()
-        while len(self.frames) == 0:
+        imgs = [0, 1]
+
+        while any(self.frames[i] is None for i in imgs):
             self.cv.wait()
-        frame = self.frames.pop(0)
+
+        for i in imgs:
+            old_grabbed = self.grabbed[i]
+            self.grabbed[i] = self.frames[i]
+            self.frames[i] = None
+            if old_grabbed is not None:
+                self.pool.append(old_grabbed)
         self.cv.release()
 
-        img = frame.image.view().reshape((481,1280)).copy()
-        ftype = frame.frame_type
+    def retrieve(self, id):
+        index = (id>>1) & 1
+        offset = (id & 1) * 640
 
-        with self.cv:
-            self.pool.append(frame)
+        if self.grabbed[index] is None:
+            return None
 
-        return img, frame.frame_type
+        return self.grabbed[index].view().reshape((481, 1280))[:, offset:offset+640]
