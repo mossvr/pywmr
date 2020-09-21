@@ -11,25 +11,31 @@ import threading
 
 MICROSOFT_VID =                 0x045e
 HOLOLENS_SENSORS_PID =          0x0659
-TRANSFER_SIZE =                 0x97000
+TRANSFER_SIZE =                 0x96C00
 HOLOLENS_MAGIC =                0x2B6F6C44
 
 class WmrCamera:
+
+    class CameraFrame:
+        def __init__(self):
+            self.frame_type = 0
+            self.seq = 0
+            self.image = np.zeros(1280*481, dtype=np.uint8)
 
     def __init__(self):
         self.started = False
         self.thread = None
 
-        self.frames = [
-            np.zeros(1280*481, dtype=np.uint8),
-            np.zeros(1280*481, dtype=np.uint8),
+        self.pool = [
+            WmrCamera.CameraFrame(),
+            WmrCamera.CameraFrame(),
+            WmrCamera.CameraFrame(),
+            WmrCamera.CameraFrame(),
         ]
-
-        self.work_frame = 0
+        self.frame = self.pool.pop()
+        self.frames = []
 
         self.cv = threading.Condition()
-        self.seq = 0
-        self.grab_seq = 0
 
         self.context = usb1.USBContext()
         self.dev = self.context.openByVendorIDAndProductID(
@@ -67,8 +73,7 @@ class WmrCamera:
         self.context.handleEventsTimeout(tv=tv)
 
     def thread_func(self):
-        self.started = True
-
+        
         self.dev.bulkWrite(0x5, struct.pack('<IIHH',
             HOLOLENS_MAGIC, # magic
             0x0c, # length
@@ -88,6 +93,7 @@ class WmrCamera:
 
     def start(self):
         self.thread = threading.Thread(target=self.thread_func)
+        self.started = True
         self.thread.start()
 
     def stop(self):
@@ -133,63 +139,68 @@ class WmrCamera:
             self.start()
 
     def parse_buffer(self, buffer):
-        pos = 0
 
         # discard partial frames
         if len(buffer) < 616538:
             return
 
-        if not self.cv.acquire(False):
-            return
-
         next_id = 0
+        pos = 0
 
-        while len(buffer) - pos >= 32:
-            header = buffer[pos:pos+32]
-            pos += 32
-            magic, = struct.unpack('<I', header[0:4])
+        while len(buffer) - pos >= 4:
 
+            # read the magic
+            magic, = struct.unpack('<I', buffer[pos:pos+4])
             if magic != HOLOLENS_MAGIC:
                 break
 
+            # check if this is the last chunk
+            if next_id == 26:
+                frame_type, = struct.unpack('<H', buffer[pos+4:pos+6])
+                self.frame.frame_type = frame_type
+                
+                with self.cv:
+                    if len(self.pool) != 0:
+                        self.frames.append(self.frame)
+                        self.frame = self.pool.pop()
+                        self.cv.notify()
+
+                break
+
+            
+            # read the header
+            header = buffer[pos:pos+32]
+            pos += 32
+
             frame_id, = struct.unpack('<I', header[4:8])
             chunk_id, = struct.unpack('<B', header[8:9])
-            chunk_len = 2080 if chunk_id == 25 else 24544
+            chunk_len = 2100 if chunk_id == 25 else 24544
 
-            #print(binascii.hexlify(header))
-            
             if chunk_id != next_id:
                 break
             
             next_id = chunk_id + 1
 
-            offset = chunk_id * 24544
-            self.frames[self.work_frame][offset:offset+chunk_len] = buffer[pos:pos+chunk_len]
+            if chunk_id == 0:
+                self.frame.seq = frame_id
 
-            if chunk_id == 25:
-                self.seq = frame_id
-                self.cv.notify()
-                break
-                
+            offset = chunk_id * 24544
+            count = 2080 if chunk_id == 25 else chunk_len
+            self.frame.image[offset:offset+count] = buffer[pos:pos+count]
+
             pos += chunk_len
 
-        self.cv.release()
-
-    def grab(self):
-        self.cv.acquire()
-        while self.seq == self.grab_seq:
-            self.cv.wait()
-
-        self.grab_seq = self.seq
-        self.work_frame = self.work_frame ^ 1
-
-        self.cv.release()
-
-    def retrieve(self, id):
-        id = id & 1
-        frame = self.frames[self.work_frame ^ 1].view().reshape((481,1280))
-        return frame[:, (id * 640):((id+1) * 640)]
-
     def read(self):
-        self.grab()
-        return self.frames[self.work_frame ^ 1].view().reshape((481,1280))
+        self.cv.acquire()
+        while len(self.frames) == 0:
+            self.cv.wait()
+        frame = self.frames.pop(0)
+        self.cv.release()
+
+        img = frame.image.view().reshape((481,1280)).copy()
+        ftype = frame.frame_type
+
+        with self.cv:
+            self.pool.append(frame)
+
+        return img, frame.frame_type
