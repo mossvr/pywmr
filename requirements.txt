@@ -1,0 +1,4 @@
+# Requirements
+libusb1
+numpy
+opencv-python
